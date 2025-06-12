@@ -153,3 +153,7 @@ The `skglm` package depends on internal utilities from `scikit-learn >= 1.3`, sp
 To ensure compatibility across environments, we inject a lightweight fallback module (`Interval`, `StrOptions`) at runtime using `sys.modules`. This patch is applied automatically before importing `skglm` and ensures the code runs smoothly without modifying the original `skglm` source code or upgrading `scikit-learn`.
 
 See [`sklearn_patch.py`](./src/sigbert/sklearn_param_validation_patch.py) for the implementation.
+
+## License
+
+- The source code is released under the MIT License – see the [LICENSE](./LICENSE) file.
