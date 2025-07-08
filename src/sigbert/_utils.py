@@ -1585,7 +1585,12 @@ def global_sigbert_process(
     lambda_l1_CV=0.7,
     order_sign=2,
     use_mat_Levy=False,
-    print_progress=False
+    print_progress=False,
+    var_id="ID",
+    var_crea="date_creation",
+    var_death="DEATH",
+    var_duration="duration",
+    learning_cox_map="sk_cox"
 ):
     """
     Full pipeline for survival prediction using compressed embeddings and signature features
@@ -1611,55 +1616,31 @@ def global_sigbert_process(
         Whether to use the Lévy area matrix in signature computation (default: False).
     print_progress : bool, optional
         Whether to display progress information during signature extraction (default: False).
+    var_id : str, optional
+        Name of the column corresponding to patient ID (default: "ID").
+    var_crea : str, optional
+        Name of the column corresponding to the report creation date (default: "date_creation").
+    var_death : str, optional
+        Name of the column corresponding to the death event indicator (default: "DEATH").
+    var_duration : str, optional
+        Name of the column for survival duration (default: "duration").
+    learning_cox_map : str, optional
+        String key for the Cox model training function (default: "sk_cox").
 
     Returns
     -------
-    df_results : pd.DataFrame
-        A DataFrame summarizing results (C-index mean/std, number of deaths, study duration stats,
-        execution time, number of reports per patient, etc.) for the given `max_reports` configuration.
-    cph : CoxPHFitter
-        Trained Cox proportional hazards model using LASSO regularization.
-    df_survival : pd.DataFrame
-        DataFrame for the training set containing survival time, event status, and risk scores.
-    w_sk : np.ndarray
-        Fitted model weights (risk scores) used for evaluation on test sets.
-    scores : np.ndarray
-        Raw model scores on the training set.
-    X : np.ndarray
-        Design matrix (features) used for training.
-    y : np.ndarray
-        Array with event indicators and survival times for the training set, before preprocess.
-    y_cox : np.ndarray
-        Structured array with event indicators and survival times for the training set.
-    c_index_train : float
-        C-index computed on the training set.
-    c_index_test_list : list of float
-        List of C-index values computed on each test group.
-    c_index_test_mean : float
-        Mean C-index across all test groups.
-    c_index_test_std : float
-        Standard deviation of the C-index across all test groups.
-    df_survival_test_list : list of pd.DataFrame
-        List of DataFrames for each test group containing survival time, event indicator,
-        and predicted risk scores.
-
+    Same output structure as original version.
     """
-    
     print(f"\n### Processing for max_reports = {max_reports} ###")
     time_start = time.time()
 
-    # Select the earliest `max_reports` reports per patient
-    df_all_quartile = df_all.sort_values(by=["ID", "date_creation"]).groupby("ID").head(max_reports)
+    df_all_quartile = df_all.sort_values(by=[var_id, var_crea]).groupby(var_id).head(max_reports)
+    std_reports = df_all_quartile.groupby(var_id)[var_crea].count().std()
 
-    # Reporting stats on number of reports
-    std_reports = df_all_quartile.groupby("ID")["date_creation"].count().std()
-
-    # TRAIN set processing
     df_train_new, df_last_obs, id_list_train = make_df_conform(df_train_new_OG, verbose=False)
-    total_train = df_last_obs['ID'].nunique()
+    total_train = df_last_obs[var_id].nunique()
     print(f"\nTotal number of individuals in the train set: {total_train}")
 
-    # TEST set processing
     for i, df_test in enumerate(test_groups, start=1):
         nam_test_new = f"df_test{i}_new"
         nam_test_last_obs = f"df_test{i}_last_obs"
@@ -1673,28 +1654,23 @@ def global_sigbert_process(
 
     df_test_new = pd.concat([globals()[f'df_test{i}_new'] for i in range(1, len(test_groups) + 1)], axis=0)
     df_last_obs_test_all = pd.concat([globals()[f'df_test{i}_last_obs'] for i in range(1, len(test_groups) + 1)], axis=0)
-    total_test = df_last_obs_test_all['ID'].nunique()
+    total_test = df_last_obs_test_all[var_id].nunique()
     print(f"Total number of individuals in the validation set: {total_test}\n")
 
-    # Combine all
     df_everyone = pd.concat([df_train_new, df_test_new], axis=0)
 
-    # Global stats with English variable names
-    total_unique_patients = df_everyone['ID'].nunique()
+    total_unique_patients = df_everyone[var_id].nunique()
     total_number_of_reports = len(df_everyone)
-    mean_reports_per_patient = df_everyone.groupby('ID').size().mean()
-    total_deceased_patients = df_everyone[df_everyone['DEATH'] == 1]['ID'].nunique()
-    total_censored_patients = df_everyone[df_everyone['DEATH'] == 0]['ID'].nunique()
+    mean_reports_per_patient = df_everyone.groupby(var_id).size().mean()
+    total_deceased_patients = df_everyone[df_everyone[var_death] == 1][var_id].nunique()
+    total_censored_patients = df_everyone[df_everyone[var_death] == 0][var_id].nunique()
 
-    # Study duration
     df_all_last = pd.concat([df_last_obs, df_last_obs_test_all])
-    mean_study_time = np.mean(df_all_last['duration'])
-    std_study_time = np.std(df_all_last['duration'])
+    mean_study_time = np.mean(df_all_last[var_duration])
+    std_study_time = np.std(df_all_last[var_duration])
 
-    # TRAIN - Projection
     df_train = apply_linear_projection(df_train_new, R_comp)
 
-    # TRAIN - Signature feature extraction
     start_training = time.time()
     Xt, y, features_name, nbr_sig, nbr_levy, id_list_train_V2 = prep_import(
         df_train,
@@ -1706,16 +1682,14 @@ def global_sigbert_process(
     duration_training = time.time() - start_training
     print(f"Signature feature computation took {duration_training:.2f}s ({duration_training / 60:.2f}min).")
 
-    # TRAIN - Cox model with LASSO
     print(" --------------- Linear LASSO training --------------- ")
     cph, df_survival, w_sk, scores, X, y_cox, c_index_train, log_likelihood, _ = global_cox_train(
         Xt, y, id_list_train_V2,
-        learning_cox_map='sk_cox',
+        learning_cox_map=learning_cox_map,
         lambda_l1_CV=lambda_l1_CV
     )
     print(" ---------------  --------------- ")
 
-    # TEST - Evaluation loop
     c_index_test_list = []
     df_survival_test_list = []
 
@@ -1744,14 +1718,11 @@ def global_sigbert_process(
         df_survival_test_list.append(df_survival_test)
         print("--- ---")
 
-    # Summary of test C-index
     c_index_test_mean = np.mean(c_index_test_list)
     c_index_test_std = np.std(c_index_test_list, ddof=1)
     time_end = time.time() - time_start
 
-    # Save results
-    c_index_test_results = []
-    c_index_test_results.append({
+    df_results = pd.DataFrame([{
         "Max Reports": max_reports,
         "Mean C-index": c_index_test_mean,
         "Std C-index": c_index_test_std,
@@ -1764,14 +1735,11 @@ def global_sigbert_process(
         "Execution Time (s)": np.round(time_end, 2),
         "Mean Reports per Patient": np.round(mean_reports_per_patient, 3),
         "Std Reports per Patient": np.round(std_reports, 3),
-    })
-
+    }])
 
     print(f"Mean c-index (test): {c_index_test_mean:.4f}")
     print(f"Standard deviation of c-index (test): {c_index_test_std:.4f}")
 
-    df_results = pd.DataFrame(c_index_test_results)
-    
     return (
         df_results, cph, df_survival, w_sk, scores, X, y, y_cox,
         c_index_train, c_index_test_list, c_index_test_mean,
