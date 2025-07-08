@@ -275,7 +275,6 @@ def preprocess_sign(
     return (df, id_list) if return_id else df
 
 
-
 def signature_extract(
     df_OG,
     order=3,
@@ -296,8 +295,8 @@ def signature_extract(
     verbose=True
 ):
     """
-    Extract signature features from time series embedding data, optionally incorporating structured variables
-    and handling missing values through binary encoding.
+    Extract signature features from time series data, based on either embedding vectors,
+    structured variables, or both.
 
     Parameters
     ----------
@@ -309,8 +308,8 @@ def signature_extract(
         If True, compute log-signatures instead of regular signatures.
     var_temp : str
         Name of the temporal variable (normalized between 0 and 1).
-    var_embd : str
-        Column name containing the input embeddings.
+    var_embd : str or None
+        Column name containing the input embeddings (if any).
     var_patient : str
         Column identifying the patient.
     var_DEATH : str
@@ -343,11 +342,21 @@ def signature_extract(
     nbr_levy : int
         Number of Levy area components (if applicable).
     """
+
     df = df_OG.copy()
 
-    embedding_dim = len(df[var_embd].iloc[0])
-    n_components = embedding_dim + 1  # +1 for time component
+    var_embd_used = (var_embd is not None)
+    embedding_dim = 0
 
+    # If embeddings are used, split them into columns
+    if var_embd_used:
+        embedding_dim = len(df[var_embd].iloc[0])
+        for i in range(embedding_dim):
+            df[f'embedding_{i}'] = df[var_embd].apply(lambda x: x[i])
+
+    n_components = 1  # time component always included
+
+    # Structured variables
     if var_structurees_list_OG:
         var_structurees_list = var_structurees_list_OG.copy()
 
@@ -361,6 +370,9 @@ def signature_extract(
 
         n_components += len(var_structurees_list)
 
+    if var_embd_used:
+        n_components += embedding_dim
+
     nbr_sig = iisignature.siglength(n_components, order)
     nbr_logsig = iisignature.logsiglength(n_components, order)
     nbr_sig_order2 = iisignature.siglength(n_components, 2)
@@ -372,25 +384,32 @@ def signature_extract(
         else:
             print(f"Number of signature components (order {order}): {nbr_sig}")
 
-    for i in range(embedding_dim):
-        df[f'embedding_{i}'] = df[var_embd].apply(lambda x: x[i])
-
     signature_results = []
 
     for id, group in df.groupby(var_patient):
-        if var_structurees_list_OG:
-            path = group[[var_temp] + [f'embedding_{i}' for i in range(embedding_dim)] + var_structurees_list].values
-        else:
-            path = group[[var_temp] + [f'embedding_{i}' for i in range(embedding_dim)]].values
+        path_cols = [var_temp]
 
-        path = np.array(path, dtype=np.float64)
+        if var_embd_used:
+            path_cols += [f'embedding_{i}' for i in range(embedding_dim)]
+
+        if var_structurees_list_OG:
+            path_cols += var_structurees_list
+
+        path = group[path_cols].values.astype(np.float64)
+
         if path.shape[1] > 256:
             raise ValueError(f"Path dimensionality exceeds allowed limit: {path.shape[1]} > 256")
 
         start_point = np.zeros((1, path.shape[1]))
         path = np.vstack([start_point, path])
 
-        signature = calculate_signature(path, order=order, use_Levy=use_mat_Levy, use_log=use_log, apply_lead_lag=apply_lead_lag)
+        signature = calculate_signature(
+            path,
+            order=order,
+            use_Levy=use_mat_Levy,
+            use_log=use_log,
+            apply_lead_lag=apply_lead_lag
+        )
         signature_dict = {f'sig_{i+1}': sig for i, sig in enumerate(signature)}
 
         signature_dict.update({
