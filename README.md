@@ -20,7 +20,7 @@ It achieved a **C-index of 0.75** (sd 0.014) on an independent validation cohort
 
 Below is a high-level overview of the SigBERT pipeline:
 
-![SigBERT Pipeline](./sigbert_pipeline.png)
+![SigBERT Pipeline](./sigbert_pipeline.PNG)
 
 A five-step approach for SigBERT:
 * **Step 1** Extract word embeddings from medical reports using OncoBERT.
