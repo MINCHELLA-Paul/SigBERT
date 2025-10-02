@@ -10,6 +10,7 @@
 
 
 import pandas as pd
+from typing import Iterable, List, Optional, Sequence, Tuple, Dict
 import numpy as np
 # %matplotlib inline
 import matplotlib.pyplot as plt
@@ -345,14 +346,14 @@ def import_and_prepare_dataframe(
 
 
 
-
 def global_data_import(
     path_import,                     # str or list of str (CSV file paths)
     var_id='ID',                     # Updated ID column name
     var_embd_str='embeddings_str',
     var_embd_out='embeddings',
     verbose=True,
-    nrows=None                       # Number of rows to read from each CSV (for testing)
+    nrows=None,                      # Number of rows to read from each CSV (for testing)
+    conformal_list=None              # Optional list of IDs to retain (filtering)
 ):
     """
     Imports, parses, and formats patient-level data from one or several CSV files. 
@@ -372,21 +373,26 @@ def global_data_import(
         Whether to print progress and summary information.
     nrows : int or None, default=None
         Number of rows to read from each file (useful for testing with partial data).
+    conformal_list : list or None, default=None
+        Optional list of patient IDs to keep in the final dataset.
 
     Returns
     -------
     pd.DataFrame
         The combined and processed DataFrame (also assigned globally as `df_data` and `df_data_OG`).
     """
-
     start = time.time()
 
     # Normalize path_import to a list
     if isinstance(path_import, str):
         path_import = [path_import]
 
-    # Read and concatenate all CSVs (optionally limiting rows)
+    # Read and concatenate all CSVs
     df = pd.concat([pd.read_csv(path, nrows=nrows) for path in path_import], ignore_index=True)
+
+    # Optional filtering based on conformal_list
+    if conformal_list is not None:
+        df = df[df[var_id].isin(conformal_list)].reset_index(drop=True)
 
     # Parse embeddings from string to numpy array
     df[var_embd_out] = df[var_embd_str].apply(lambda x: np.fromstring(x, sep=' '))
@@ -602,6 +608,7 @@ def prep_import(
     var_known="duration_known",
     var_death="DEATH",
     var_duration="duree",
+    interpolation_type = "linear",
     var_struct_seq_list_OG=None,
     use_missing_encoding=False,
     retire_duration_known=False,
@@ -688,6 +695,7 @@ def prep_import(
         var_embd=var_embd,
         use_log=use_log,
         use_mat_Levy=use_mat_Levy,
+        interpolation_type = interpolation_type,
         var_structurees_list_OG=var_struct_seq_list_OG,
         use_missing_encoding=use_missing_encoding,
         verbose=verbose
@@ -1587,50 +1595,20 @@ def global_sigbert_process(
     use_mat_Levy=False,
     print_progress=False,
     var_id="ID",
+    var_embd="embeddings",
     var_crea="date_creation",
     var_death="DEATH",
     var_duration="duration",
-    learning_cox_map="sk_cox"
+    learning_cox_map="sk_cox",
+    interpolation_type = "linear",
+    var_struct_seq_list=None,
+    df_matrix_covar=None,
+    use_other_covar=False,
+    use_standard_scale=False,
+    id_list_training=None
 ):
-    """
-    Full pipeline for survival prediction using compressed embeddings and signature features
-    across multiple timepoints and multiple test groups, evaluated via the C-index.
+    from sklearn.preprocessing import StandardScaler
 
-    Parameters
-    ----------
-    max_reports : int
-        Maximum number of reports per patient to include (earliest in time).
-    df_all : pd.DataFrame
-        The complete dataset with all patients and reports (used for stat reporting).
-    df_train_new_OG : pd.DataFrame
-        Raw training data before preprocessing and projection.
-    test_groups : list of pd.DataFrame
-        List of test datasets.
-    R_comp : np.ndarray
-        Linear projection matrix used to compress the embedding features.
-    lambda_l1_CV : float, optional
-        Regularization strength for LASSO (default: 0.7).
-    order_sign : int, optional
-        Order of the path signature used to extract features from the embedded sequences (default: 2).
-    use_mat_Levy : bool, optional
-        Whether to use the Lévy area matrix in signature computation (default: False).
-    print_progress : bool, optional
-        Whether to display progress information during signature extraction (default: False).
-    var_id : str, optional
-        Name of the column corresponding to patient ID (default: "ID").
-    var_crea : str, optional
-        Name of the column corresponding to the report creation date (default: "date_creation").
-    var_death : str, optional
-        Name of the column corresponding to the death event indicator (default: "DEATH").
-    var_duration : str, optional
-        Name of the column for survival duration (default: "duration").
-    learning_cox_map : str, optional
-        String key for the Cox model training function (default: "sk_cox").
-
-    Returns
-    -------
-    Same output structure as original version.
-    """
     print(f"\n### Processing for max_reports = {max_reports} ###")
     time_start = time.time()
 
@@ -1658,7 +1636,6 @@ def global_sigbert_process(
     print(f"Total number of individuals in the validation set: {total_test}\n")
 
     df_everyone = pd.concat([df_train_new, df_test_new], axis=0)
-
     total_unique_patients = df_everyone[var_id].nunique()
     total_number_of_reports = len(df_everyone)
     mean_reports_per_patient = df_everyone.groupby(var_id).size().mean()
@@ -1669,22 +1646,44 @@ def global_sigbert_process(
     mean_study_time = np.mean(df_all_last[var_duration])
     std_study_time = np.std(df_all_last[var_duration])
 
-    df_train = apply_linear_projection(df_train_new, R_comp)
+    df_train = apply_linear_projection(df_train_new, R_comp, var_embd=var_embd)
 
     start_training = time.time()
     Xt, y, features_name, nbr_sig, nbr_levy, id_list_train_V2 = prep_import(
         df_train,
         t_pred=None,
         order_sign=order_sign,
+        interpolation_type = interpolation_type,
+        var_struct_seq_list_OG=var_struct_seq_list,
         use_mat_Levy=use_mat_Levy,
         print_progress=print_progress
     )
-    duration_training = time.time() - start_training
-    print(f"Signature feature computation took {duration_training:.2f}s ({duration_training / 60:.2f}min).")
+
+    if use_other_covar:
+        if df_matrix_covar is not None:
+            df_sig = pd.DataFrame({var_id: id_list_train_V2})
+            df_Xt = pd.DataFrame(Xt)
+            df_temp = pd.concat([df_sig, df_Xt], axis=1)
+            df_merge = df_temp.merge(df_matrix_covar, on=var_id, how='left')
+            
+            id_list_training = list(df_merge[var_id])
+            print(f"Number of individuals in training: {len(id_list_training)}")
+            
+            df_merge = df_merge.drop(columns=[var_id])
+            Xt = df_merge.to_numpy()
+        else:
+            raise ValueError("`use_other_covar=True` but `df_matrix_covar` is None.")
+
+    if use_standard_scale:
+        scaler = StandardScaler()
+        Xt = scaler.fit_transform(Xt)
+
+    print(f"Signature feature computation took {time.time() - start_training:.2f}s\n")
 
     print(" --------------- Linear LASSO training --------------- ")
     cph, df_survival, w_sk, scores, X, y_cox, c_index_train, log_likelihood, _ = global_cox_train(
-        Xt, y, id_list_train_V2,
+        Xt, y,
+        id_list_train=id_list_training,
         learning_cox_map=learning_cox_map,
         lambda_l1_CV=lambda_l1_CV
     )
@@ -1694,15 +1693,30 @@ def global_sigbert_process(
     df_survival_test_list = []
 
     for i, df_test_new in enumerate(test_groups, start=1):
-        df_test = apply_linear_projection(df_test_new, R_comp)
-
+        df_test = apply_linear_projection(df_test_new, R_comp, var_embd=var_embd)
         Xt_test, y_test, _, _, _, id_list_test_i = prep_import(
             df_test,
             t_pred=None,
             order_sign=order_sign,
+            interpolation_type = interpolation_type,
+            var_struct_seq_list_OG=var_struct_seq_list,
             use_mat_Levy=use_mat_Levy,
             print_progress=print_progress
         )
+
+        if use_other_covar:
+            if df_matrix_covar is not None:
+                df_sig_test = pd.DataFrame({var_id: id_list_test_i})
+                df_Xt_test = pd.DataFrame(Xt_test)
+                df_temp_test = pd.concat([df_sig_test, df_Xt_test], axis=1)
+                df_merge_test = df_temp_test.merge(df_matrix_covar, on=var_id, how='left')
+                df_merge_test = df_merge_test.drop(columns=[var_id])
+                Xt_test = df_merge_test.to_numpy()
+            else:
+                raise ValueError("`use_other_covar=True` but `df_matrix_covar` is None.")
+
+        if use_standard_scale:
+            Xt_test = scaler.transform(Xt_test)
 
         print(f"\n--- Test Case {i} for max_reports = {max_reports} ---")
         df_survival_test, c_index_test, Xtest, ytest = skglm_datatest(
@@ -1740,8 +1754,815 @@ def global_sigbert_process(
     print(f"Mean c-index (test): {c_index_test_mean:.4f}")
     print(f"Standard deviation of c-index (test): {c_index_test_std:.4f}")
 
+    # Add column "ID" to df_survival using id_list_train_V2
+    # if len(id_list_train_V2) == len(df_survival):
+        # df_survival["ID"] = id_list_train_V2
+    # else:
+        # df_survival["ID"] = id_list_training
+
     return (
         df_results, cph, df_survival, w_sk, scores, X, y, y_cox,
         c_index_train, c_index_test_list, c_index_test_mean,
         c_index_test_std, df_survival_test_list
     )
+
+
+
+
+
+def global_sigbert_structured_process(
+    df_train_new_OG,
+    test_groups,
+    var_struct_seq_list,
+    lambda_l1_CV=0.7,
+    order_sign=2,
+    use_mat_Levy=False,
+    print_progress=False,
+    var_id="ID",
+    var_crea="date_creation",
+    var_death="DEATH",
+    var_duration="duration",
+    interpolation_type = "linear",
+    learning_cox_map="sk_cox"
+):
+    """
+    Pipeline for survival prediction on structured covariates using signature features
+    extracted from structured sequences, without embedding compression.
+
+    Parameters
+    ----------
+    df_train_new_OG : pd.DataFrame
+        Raw training data.
+    test_groups : list of pd.DataFrame
+        List of test datasets.
+    var_struct_seq_list_OG : list of str
+        List of column names to be used as sequential structured variables for signature extraction.
+    lambda_l1_CV : float, optional
+        Regularization strength for LASSO (default: 0.7).
+    order_sign : int, optional
+        Order of the path signature used to extract features (default: 2).
+    use_mat_Levy : bool, optional
+        Whether to use the Lévy area matrix (default: False).
+    print_progress : bool, optional
+        Whether to display progress information (default: False).
+    var_id : str, optional
+        Name of the column corresponding to patient ID (default: "ID").
+    var_crea : str, optional
+        Name of the column corresponding to the report creation date (default: "date_creation").
+    var_death : str, optional
+        Name of the column corresponding to the death event indicator (default: "DEATH").
+    var_duration : str, optional
+        Name of the column for survival duration (default: "duration").
+    learning_cox_map : str, optional
+        String key for the Cox model training function (default: "sk_cox").
+    Returns
+    -------
+    Same outputs as global_sigbert_process, adapted to structured inputs.
+    """
+
+    time_start = time.time()
+
+    # TRAIN set processing
+    df_train_new, df_last_obs, id_list_train = make_df_conform(df_train_new_OG, verbose=False, var_id=var_id)
+    total_train = df_last_obs[var_id].nunique()
+    print(f"\nTotal number of individuals in the train set: {total_train}")
+
+    # TEST set processing
+    for i, df_test in enumerate(test_groups, start=1):
+        nam_test_new = f"df_test{i}_new"
+        nam_test_last_obs = f"df_test{i}_last_obs"
+        nam_id_list = f"id_list_test{i}"
+
+        for var_name in [nam_test_new, nam_test_last_obs, nam_id_list]:
+            if var_name in globals():
+                del globals()[var_name]
+
+        globals()[nam_test_new], globals()[nam_test_last_obs], globals()[nam_id_list] = make_df_conform(df_test, 
+                                                                                                        verbose=False,
+                                                                                                        var_id=var_id)
+
+    df_test_new = pd.concat([globals()[f'df_test{i}_new'] for i in range(1, len(test_groups) + 1)], axis=0)
+    df_last_obs_test_all = pd.concat([globals()[f'df_test{i}_last_obs'] for i in range(1, len(test_groups) + 1)], axis=0)
+    total_test = df_last_obs_test_all[var_id].nunique()
+    print(f"Total number of individuals in the validation set: {total_test}\n")
+
+    # Combine all
+    df_everyone = pd.concat([df_train_new, df_test_new], axis=0)
+
+    # Global stats
+    total_unique_patients = df_everyone[var_id].nunique()
+    total_number_of_reports = len(df_everyone)
+    mean_reports_per_patient = df_everyone.groupby(var_id).size().mean()
+    total_deceased_patients = df_everyone[df_everyone[var_death] == 1][var_id].nunique()
+    total_censored_patients = df_everyone[df_everyone[var_death] == 0][var_id].nunique()
+
+    df_all_last = pd.concat([df_last_obs, df_last_obs_test_all])
+    mean_study_time = np.mean(df_all_last[var_duration])
+    std_study_time = np.std(df_all_last[var_duration])
+
+    # Signature feature extraction (TRAIN)
+    start_training = time.time()
+    Xt, y, features_name, nbr_sig, nbr_levy, id_list_train_V2 = prep_import(
+        df_train_new,
+        var_struct_seq_list_OG=var_struct_seq_list,
+        order_sign=order_sign,
+        use_mat_Levy=use_mat_Levy,
+        print_progress=print_progress,
+        var_id=var_id,
+        var_embd=None,
+        interpolation_type=interpolation_type
+    )
+    duration_training = time.time() - start_training
+    print(f"Signature feature computation took {duration_training:.2f}s ({duration_training / 60:.2f}min).")
+
+    # Cox model training
+    print(" --------------- Linear LASSO training --------------- ")
+    cph, df_survival, w_sk, scores, X, y_cox, c_index_train, log_likelihood, _ = global_cox_train(
+        Xt, y, id_list_train_V2,
+        learning_cox_map=learning_cox_map,
+        lambda_l1_CV=lambda_l1_CV
+    )
+    print(" ---------------  --------------- ")
+
+    # TEST evaluation
+    c_index_test_list = []
+    df_survival_test_list = []
+
+    for i, df_test_new in enumerate(test_groups, start=1):
+        df_test = globals()[f'df_test{i}_new']
+        Xt_test, y_test, _, _, _, id_list_test_i = prep_import(
+            df_test,
+            var_struct_seq_list_OG=var_struct_seq_list,
+            order_sign=order_sign,
+            use_mat_Levy=use_mat_Levy,
+            print_progress=print_progress,
+            var_id=var_id,
+            var_embd=None,
+            interpolation_type = interpolation_type
+        )
+
+        print(f"\n--- Test Case {i} ---")
+        df_survival_test, c_index_test, Xtest, ytest = skglm_datatest(
+            Xt_test,
+            y_test,
+            w_sk,
+            cph,
+            id_list_test_i,
+            plot_curves=False
+        )
+
+        c_index_test_list.append(c_index_test)
+        df_survival_test_list.append(df_survival_test)
+        print("--- ---")
+
+    # Summary
+    c_index_test_mean = np.mean(c_index_test_list)
+    c_index_test_std = np.std(c_index_test_list, ddof=1)
+    time_end = time.time() - time_start
+
+    df_results = pd.DataFrame([{
+        "Mean C-index": c_index_test_mean,
+        "Std C-index": c_index_test_std,
+        "Total Deceased Patients": total_deceased_patients,
+        "Total Censored Patients": total_censored_patients,
+        "Total Unique Patients": total_unique_patients,
+        "Total Number of Reports": total_number_of_reports,
+        "Mean Study Time (days)": np.round(mean_study_time, 3),
+        "Std Study Time (days)": np.round(std_study_time, 3),
+        "Execution Time (s)": np.round(time_end, 2),
+        "Mean Reports per Patient": np.round(mean_reports_per_patient, 3)
+    }])
+
+    print(f"Mean c-index (test): {c_index_test_mean:.4f}")
+    print(f"Standard deviation of c-index (test): {c_index_test_std:.4f}")
+
+    return (
+        df_results, cph, df_survival, w_sk, scores, X, y, y_cox,
+        c_index_train, c_index_test_list, c_index_test_mean,
+        c_index_test_std, df_survival_test_list
+    )
+
+
+
+def global_sigbert_structured_process_V2(
+    df_train_new_OG,
+    test_groups,
+    var_struct_seq_list,
+    R_comp=None,
+    lambda_l1_CV=0.7,
+    order_sign=2,
+    use_mat_Levy=False,
+    print_progress=False,
+    var_id="ID",
+    var_embd=None,
+    var_crea="date_creation",
+    var_death="DEATH",
+    var_event='event',
+    var_time='time',
+    var_duration="duration",
+    learning_cox_map="sk_cox",
+    df_matrix_covar=None,
+    use_other_covar=False,
+    use_standard_scale=False,
+    id_list_training=None
+):
+    """
+    Pipeline for survival prediction on structured covariates using signature features
+    extracted from sequential structured variables, with optional inclusion of additional
+    non-sequential covariates.
+
+    Parameters
+    ----------
+    df_train_new_OG : pd.DataFrame
+        Raw training data.
+    test_groups : list of pd.DataFrame
+        List of test datasets.
+    var_struct_seq_list : list of str
+        List of column names to be used as sequential structured variables for signature extraction.
+    lambda_l1_CV : float, optional
+        Regularization strength for LASSO (default: 0.7).
+    order_sign : int, optional
+        Order of the path signature used to extract features (default: 2).
+    use_mat_Levy : bool, optional
+        Whether to use the Lévy area matrix in signature computation (default: False).
+    print_progress : bool, optional
+        Whether to print progress updates during feature extraction (default: False).
+    var_id : str, optional
+        Column name identifying patients (default: "ID").
+    var_crea : str, optional
+        Column name for report creation date (default: "date_creation").
+    var_death : str, optional
+        Column name for death event indicator (default: "DEATH").
+    var_duration : str, optional
+        Column name for survival duration (default: "duration").
+    learning_cox_map : str, optional
+        Backend used for Cox model training (default: "sk_cox").
+    df_matrix_covar : pd.DataFrame, optional
+        DataFrame of additional covariates to be concatenated to the design matrix.
+        Must include `var_id` column and be aligned by patient.
+    use_other_covar : bool, optional
+        Whether to include `df_matrix_covar` in the final design matrix (default: False).
+    use_standard_scale : bool, optional  
+        Whether to standardize the final design matrix using sklearn's StandardScaler  
+        (default: False).  
+
+    Returns
+    -------
+    df_results : pd.DataFrame
+        Summary table with C-index scores, cohort characteristics, and execution time.
+    cph : CoxPHFitter
+        Trained Cox proportional hazards model.
+    df_survival : pd.DataFrame
+        Survival prediction dataframe for the training set.
+    w_sk : np.ndarray
+        Model weights (risk scores).
+    scores : np.ndarray
+        Linear predictors from the Cox model.
+    X : np.ndarray
+        Design matrix used for training.
+    y : np.ndarray
+        Array with event indicators and durations.
+    y_cox : np.ndarray
+        Structured survival array (event, duration).
+    c_index_train : float
+        C-index on the training set.
+    c_index_test_list : list of float
+        List of C-index values per test group.
+    c_index_test_mean : float
+        Mean C-index across test groups.
+    c_index_test_std : float
+        Standard deviation of the test C-index.
+    df_survival_test_list : list of pd.DataFrame
+        Survival prediction outputs for each test group.
+    """
+
+    time_start = time.time()
+
+    # TRAIN
+    df_train_new, df_last_obs, id_list_train = make_df_conform(df_train_new_OG, verbose=False)
+    total_train = df_last_obs[var_id].nunique()
+    print(f"\nTotal number of individuals in the train set: {total_train}")
+
+    # TESTS
+    for i, df_test in enumerate(test_groups, start=1):
+        nam_test_new = f"df_test{i}_new"
+        nam_test_last_obs = f"df_test{i}_last_obs"
+        nam_id_list = f"id_list_test{i}"
+
+        for var_name in [nam_test_new, nam_test_last_obs, nam_id_list]:
+            if var_name in globals():
+                del globals()[var_name]
+
+        globals()[nam_test_new], globals()[nam_test_last_obs], globals()[nam_id_list] = make_df_conform(df_test, verbose=False)
+
+    df_test_new = pd.concat([globals()[f'df_test{i}_new'] for i in range(1, len(test_groups) + 1)], axis=0)
+    df_last_obs_test_all = pd.concat([globals()[f'df_test{i}_last_obs'] for i in range(1, len(test_groups) + 1)], axis=0)
+    total_test = df_last_obs_test_all[var_id].nunique()
+    print(f"Total number of individuals in the validation set: {total_test}\n")
+
+    # Global stats
+    df_everyone = pd.concat([df_train_new, df_test_new], axis=0)
+    total_unique_patients = df_everyone[var_id].nunique()
+    total_number_of_reports = len(df_everyone)
+    mean_reports_per_patient = df_everyone.groupby(var_id).size().mean()
+    total_deceased_patients = df_everyone[df_everyone[var_death] == 1][var_id].nunique()
+    total_censored_patients = df_everyone[df_everyone[var_death] == 0][var_id].nunique()
+
+    df_all_last = pd.concat([df_last_obs, df_last_obs_test_all])
+    mean_study_time = np.mean(df_all_last[var_duration])
+    std_study_time = np.std(df_all_last[var_duration])
+
+    if var_embd:
+        df_train = apply_linear_projection(df_train_new, R_comp, var_embd=var_embd)
+    else:
+        df_train = df_train_new
+
+    # Signature features
+    start_training = time.time()
+    Xt, y, features_name, nbr_sig, nbr_levy, id_list_train_V2 = prep_import(
+        df_train,
+        var_embd=var_embd,
+        var_struct_seq_list_OG=var_struct_seq_list,
+        order_sign=order_sign,
+        use_mat_Levy=use_mat_Levy,
+        print_progress=print_progress,
+        interpolation_type = interpolation_type
+    )
+    duration_training = time.time() - start_training
+    print(f"Signature feature computation took {duration_training:.2f}s ({duration_training / 60:.2f}min).")
+
+    if use_other_covar:
+        print("---- Use of other covariates ----\n")
+        if df_matrix_covar is not None:
+            # Merge covariate matrix using var_id
+            df_sig = pd.DataFrame({var_id: id_list_train_V2})
+            df_Xt = pd.DataFrame(Xt)
+            df_temp = pd.concat([df_sig, df_Xt], axis=1)
+
+            df_merge = df_temp.merge(df_matrix_covar, on=var_id, how='left')
+            df_merge = df_merge.drop(columns=[var_id])
+            Xt = df_merge.to_numpy()
+            # print(f"Number of covariates: {Xt.shape[1]}")
+        else:
+            raise ValueError("`use_other_covar=True` but `df_matrix_covar` is None.")
+
+    # Standardize the features in Xt using StandardScaler if requested
+    if use_standard_scale:
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        Xt = scaler.fit_transform(Xt)
+
+    # Restrict id_list_train_V2 to only those IDs present in df_train_new_OG
+    id_list_train_V2 = list(set(id_list_train_V2).intersection(df_train_new_OG[var_id].unique()))
+
+    # Ensure Xt is a DataFrame with patient IDs as index
+    if isinstance(Xt, np.ndarray):
+        Xt = pd.DataFrame(Xt, index=id_list_train_V2)
+    
+    # Ensure y is a DataFrame, and set patient IDs as index if needed
+    if isinstance(y, np.ndarray):
+        y = pd.DataFrame(y, columns=[var_event, var_time])  # or adapt columns accordingly
+        y.index = id_list_train_V2
+    elif var_id in y.columns:
+        y = y.set_index(var_id)
+    
+    # Intersect the indices to keep only patients present in both Xt and y
+    common_ids = Xt.index.intersection(y.index)
+    
+    # Align Xt and y to the same patient set
+    Xt = Xt.loc[common_ids]
+    y = y.loc[common_ids].reset_index()  # Reset index for y if required by later code
+    
+    # Final check for alignment
+    assert Xt.shape[0] == y.shape[0], "Mismatch between Xt and y lengths"
+
+
+
+    # print(f"Xt shape: {Xt.shape}")
+    # print(f"y shape: {y.shape}")
+    # print(f"Index match: {Xt.index.equals(y.index)}")
+
+    # Cox model
+    print(" --------------- Linear LASSO training --------------- ")
+    cph, df_survival, w_sk, scores, X, y_cox, c_index_train, log_likelihood, _ = global_cox_train(
+        Xt, y, 
+        id_list_train=id_list_training, #id_list_train=id_list_train_V2,
+        learning_cox_map=learning_cox_map,
+        lambda_l1_CV=lambda_l1_CV
+    )
+    print(" ---------------  --------------- ")
+
+    # TESTS
+    c_index_test_list = []
+    df_survival_test_list = []
+
+    for i, _ in enumerate(test_groups, start=1):
+        df_test = globals()[f'df_test{i}_new']
+        if var_embd:
+            df_test = apply_linear_projection(df_test, R_comp, var_embd=var_embd)
+                
+        Xt_test, y_test, _, _, _, id_list_test_i = prep_import(
+            df_test,
+            var_embd=var_embd,
+            var_struct_seq_list_OG=var_struct_seq_list,
+            order_sign=order_sign,
+            use_mat_Levy=use_mat_Levy,
+            print_progress=print_progress,
+            interpolation_type = interpolation_type
+        )
+
+        # Merge with additional covariates if requested
+        if use_other_covar:
+            print(f"---- Use of other covariates (Test Case {i}) ----\n")
+            if df_matrix_covar is not None:
+                # Merge covariate matrix using var_id
+                df_sig_test = pd.DataFrame({var_id: id_list_test_i})
+                df_Xt_test = pd.DataFrame(Xt_test)
+                df_temp_test = pd.concat([df_sig_test, df_Xt_test], axis=1)
+
+                df_merge_test = df_temp_test.merge(df_matrix_covar, on=var_id, how='left')
+                df_merge_test = df_merge_test.drop(columns=[var_id])
+                Xt_test = df_merge_test.to_numpy()
+            else:
+                raise ValueError("`use_other_covar=True` but `df_matrix_covar` is None.")
+
+        # Standardize Xt_test if required
+        if use_standard_scale:
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            Xt_test = scaler.fit_transform(Xt_test)
+
+        print(f"\n--- Test Case {i} ---")
+        df_survival_test, c_index_test, Xtest, ytest = skglm_datatest(
+            Xt_test,
+            y_test,
+            w_sk,
+            cph,
+            id_list_test_i,
+            plot_curves=False
+        )
+        
+        c_index_test_list.append(c_index_test)
+        df_survival_test_list.append(df_survival_test)
+        print("--- ---")
+
+    # Summary
+    c_index_test_mean = np.mean(c_index_test_list)
+    c_index_test_std = np.std(c_index_test_list, ddof=1)
+    time_end = time.time() - time_start
+
+    df_results = pd.DataFrame([{
+        "Mean C-index": c_index_test_mean,
+        "Std C-index": c_index_test_std,
+        "Total Deceased Patients": total_deceased_patients,
+        "Total Censored Patients": total_censored_patients,
+        "Total Unique Patients": total_unique_patients,
+        "Total Number of Reports": total_number_of_reports,
+        "Mean Study Time (days)": np.round(mean_study_time, 3),
+        "Std Study Time (days)": np.round(std_study_time, 3),
+        "Execution Time (s)": np.round(time_end, 2),
+        "Mean Reports per Patient": np.round(mean_reports_per_patient, 3)
+    }])
+
+    print(f"Mean c-index (test): {c_index_test_mean:.4f}")
+    print(f"Standard deviation of c-index (test): {c_index_test_std:.4f}")
+
+    return (
+        df_results, cph, df_survival, w_sk, scores, X, y, y_cox,
+        c_index_train, c_index_test_list, c_index_test_mean,
+        c_index_test_std, df_survival_test_list
+    )
+
+
+
+
+########################################################################################
+#                                                                                      #
+#                                                                                      #
+#                                                                                      #
+#                                  Structured Variables                                #
+#                                                                                      #
+#                                                                                      #
+#                                                                                      #
+########################################################################################
+
+
+
+def load_sequence_data(
+    path_seq: str,
+    ippr_conforme: Iterable,
+    sep: str = ";",
+    id_col_original: str = "IPPR",
+    id_col_final: str = "ID",
+    date_col: str = "DATE_DONNEE",
+    type_col: str = "TYPE_DONNEE_EVOLUTIVE",
+    label_col: str = "LIBELLE",
+    unit_col: str = "UNITE",
+    limit_ids: Optional[int] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load and filter sequential data from a CSV file, normalize identifiers, and build a
+    unique mapping between an evolutionary type and its label/unit.
+
+    This function generalizes a common notebook cell:
+      1) Read the CSV of evolving data (semicolon-separated by default).
+      2) Normalize the identifier column: 'IPPR' -> 'ID' (configurable).
+      3) Filter rows to the provided list of conforming IDs.
+      4) Parse the date column to datetime.
+      5) Build a unique mapping between `type_col` and (label_col, unit_col).
+
+    Parameters
+    ----------
+    path_seq : str
+        Path to the input CSV file (e.g., './donnees-evolutives.csv').
+    ippr_conforme : Iterable
+        Collection of valid identifiers to keep. Can be a list, set, Series, etc.
+        If it's a DataFrame/Series containing the original ID column, pass the
+        extracted iterable; otherwise provide the iterable directly.
+    sep : str, default=";"
+        Field delimiter used in the CSV.
+    id_col_original : str, default="IPPR"
+        Name of the identifier column in the raw file (will be renamed).
+    id_col_final : str, default="ID"
+        Final standardized name for the identifier column.
+    date_col : str, default="DATE_DONNEE"
+        Name of the date column to parse with pandas.to_datetime.
+    type_col : str, default="TYPE_DONNEE_EVOLUTIVE"
+        Name of the column describing the type of evolving information.
+    label_col : str, default="LIBELLE"
+        Name of the label column associated with the type.
+    unit_col : str, default="UNITE"
+        Name of the unit column associated with the type.
+    limit_ids : int or None, default=None
+        If provided, only the first `limit_ids` identifiers from `ippr_conforme`
+        are kept (useful for quick tests).
+
+    Returns
+    -------
+    df_seq : pd.DataFrame
+        Filtered DataFrame with the identifier column renamed to `id_col_final`
+        and the date column parsed as datetime.
+    mapping_type : pd.DataFrame
+        A de-duplicated mapping indexed by `type_col` with columns
+        `[label_col, unit_col]`.
+
+    Raises
+    ------
+    ValueError
+        If required columns are missing from the input file.
+
+    Examples
+    --------
+    >>> df_seq, mapping = load_sequence_data(
+    ...     path_seq="./donnees-evolutives.csv",
+    ...     ippr_conforme=list_of_ids  # or a pandas Series of IDs
+    ... )
+    """
+    # Read CSV
+    df_seq = pd.read_csv(path_seq, sep=sep)
+
+    # Validate required columns
+    required_cols = {id_col_original, date_col, type_col, label_col, unit_col}
+    missing = required_cols.difference(df_seq.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in '{path_seq}': {sorted(missing)}")
+
+    ippr_conforme = ippr_conforme[id_col_original].tolist()
+    
+    # Filter to conforming IDs
+    # df_seq = df_seq[df_seq[id_col_original].isin(ids_set)].copy()
+    df_seq = df_seq[df_seq[id_col_original].isin(ippr_conforme)].copy()
+    # Parse date column
+    df_seq[date_col] = pd.to_datetime(df_seq[date_col], errors="coerce")
+
+    # Build unique mapping (TYPE_DONNEE_EVOLUTIVE -> [LIBELLE, UNITE])
+    mapping_type = (
+        df_seq[[type_col, label_col, unit_col]]
+        .drop_duplicates()
+        .set_index(type_col)
+        .sort_index()
+    )
+
+    # Rename identifier column: 'IPPR' -> 'ID' (configurable)
+    if id_col_original != id_col_final:
+        df_seq = df_seq.rename(columns={id_col_original: id_col_final})
+
+    return df_seq, mapping_type
+
+
+
+def build_wide_table_and_metadata(
+    df_seq: pd.DataFrame,
+    mapping_type_libelle: pd.DataFrame,
+    *,
+    # Column names (raw)
+    var_id_original: str = "ID",
+    var_temp: str = "DATE_DONNEE",
+    type_col: str = "TYPE_DONNEE_EVOLUTIVE",
+    value_col: str = "CODE",
+    label_col: str = "LIBELLE",
+    unit_col: str = "UNITE",
+    # Normalization
+    var_id_final: str = "ID",
+    # Variable taxonomy
+    ordinal_codes: Sequence[str] = ("PS", "KAR"),
+    # Keep list (will be constructed inside as [ID, DATE] + covariables_list)
+    covariables_list: Sequence[str] = ("PO", "KAR", "PS", "IMC", "TA", "PL", "TAI"),
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build a patient-date wide table from a long sequential dataset and augment metadata.
+
+    This function generalizes a notebook workflow:
+      1) Collect the set of unique (patient, date) combinations.
+      2) Left-join the long table to ensure a full grid of (patient, date).
+      3) Pivot to wide with one column per `type_col`, values from `value_col`.
+      4) Convert columns to numeric whenever possible (handle comma decimals).
+      5) Compute non-NaN coverage per variable and add it into `mapping_type_libelle`.
+      6) Classify variables as NUMERICAL/CATEGORICAL, override given `ordinal_codes` to ORDINAL.
+      7) Compute number of modalities for categorical variables (∞ for numerical).
+      8) Keep only requested columns: [ID, DATE] + `covariables_list`.
+      9) Return the filtered wide table and the aligned/augmented mapping.
+
+    Parameters
+    ----------
+    df_seq : pd.DataFrame
+        Long-form sequential data containing at least:
+        [var_id_original, var_temp, type_col, value_col] and ideally [label_col, unit_col].
+    mapping_type_libelle : pd.DataFrame
+        Metadata table indexed by `type_col` with at least columns [label_col, unit_col].
+        It will be augmented with coverage and typing info and filtered to variables
+        effectively present in the wide table.
+    var_id_original : str, default="IPPR"
+        Name of the raw patient identifier column in `df_seq`.
+    var_temp : str, default="DATE_DONNEE"
+        Name of the time column.
+    type_col : str, default="TYPE_DONNEE_EVOLUTIVE"
+        Name of the variable/type column to pivot into wide columns.
+    value_col : str, default="CODE"
+        Name of the value column to populate wide cells.
+    label_col : str, default="LIBELLE"
+        Column in `mapping_type_libelle` describing the type's label.
+    unit_col : str, default="UNITE"
+        Column in `mapping_type_libelle` describing the type's unit. Presence is used
+        as a proxy to decide NUMERICAL vs. CATEGORICAL (can be overridden downstream).
+    var_id_final : str, default="ID"
+        Final normalized patient identifier name. The wide table will expose this name.
+    ordinal_codes : Sequence[str], default=("PS","KAR")
+        Set of variable codes from `type_col` that should be forced to ORDINAL.
+    covariables_list : Sequence[str], default=("PO","KAR","PS","IMC","TA","PL","TAI")
+        List of target variable columns to retain (alongside ID and DATE).
+
+    Returns
+    -------
+    df_wide_filtered : pd.DataFrame
+        Wide-format table with columns [var_id_final, var_temp] + `covariables_list`
+        (kept only if present in the pivoted data).
+    mapping_libelle_filtered : pd.DataFrame
+        `mapping_type_libelle` augmented with:
+            - PERCENT_NON_NAN : float in [0,100]
+            - Type_Var        : {"NUMERICAL","CATEGORICAL","ORDINAL"}
+            - NBR_MOD         : number of levels for categorical, ∞ for numerical
+        and filtered to the variables present in `df_wide_filtered`.
+
+    Notes
+    -----
+    - Numeric conversion: any non-ID/non-date column is attempted as numeric using:
+        str -> replace comma decimal -> to_numeric(errors='coerce').
+      Columns that cannot be parsed remain NaN (and will count in coverage).
+    - Coverage metric is computed after parsing on the pivoted wide table.
+    """
+    # --- 1) Unique dates per patient
+    df_dates = (
+        df_seq.groupby(var_id_original)[var_temp]
+        .unique()
+        .explode()
+        .reset_index()
+        .rename(columns={var_id_original: var_id_final})
+    )
+
+    # --- 2) Left join to have full (ID, DATE) grid
+    df_seq_norm = df_seq.rename(columns={var_id_original: var_id_final})
+    df_wide = df_dates.merge(
+        df_seq_norm[[var_id_final, var_temp, type_col, value_col]],
+        on=[var_id_final, var_temp],
+        how="left",
+    )
+
+    # --- 3) Pivot to wide
+    df_wide = df_wide.pivot_table(
+        index=[var_id_final, var_temp],
+        columns=type_col,
+        values=value_col,
+        aggfunc="first",
+    ).reset_index()
+
+    # --- 4) Numeric conversion when possible (exclude ID and DATE)
+    candidate_cols = [c for c in df_wide.columns if c not in (var_id_final, var_temp)]
+    # Replace comma decimals and coerce
+    for col in candidate_cols:
+        # Only operate on object/string-like columns; float dtypes are left as-is
+        if df_wide[col].dtype == object:
+            # Safe string ops (NaN preserved), then numeric coercion
+            df_wide[col] = pd.to_numeric(
+                df_wide[col].astype(str).str.replace(",", ".", regex=False),
+                errors="coerce",
+            )
+
+    # Clean any literal 'nan' strings that might remain (defensive)
+    df_wide.replace("nan", np.nan, inplace=True)
+
+    # --- 5) Non-NaN coverage per variable (exclude ID and DATE)
+    non_nan_ratio = df_wide.drop(columns=[var_id_final, var_temp]).notna().mean()
+    percent_non_nan = (non_nan_ratio * 100.0).round(2)
+
+    # Ensure mapping index is type codes
+    if mapping_type_libelle.index.name != type_col:
+        # If mapping has a column for type_col, set it as index, else assume current index is correct
+        if type_col in mapping_type_libelle.columns:
+            mapping_type_libelle = mapping_type_libelle.set_index(type_col)
+
+    # Align coverage onto mapping (missing vars → 0%)
+    mapping_type_libelle = mapping_type_libelle.copy()
+    mapping_type_libelle["PERCENT_NON_NAN"] = mapping_type_libelle.index.map(percent_non_nan)
+    mapping_type_libelle["PERCENT_NON_NAN"] = mapping_type_libelle["PERCENT_NON_NAN"].fillna(0.0)
+
+    # --- 6) Variable typing
+    # Default: NUMERICAL if unit present, else CATEGORICAL
+    mapping_type_libelle["Type_Var"] = mapping_type_libelle[unit_col].apply(
+        lambda u: "NUMERICAL" if pd.notna(u) else "CATEGORICAL"
+    )
+    # Override: specified codes as ORDINAL
+    if ordinal_codes:
+        mapping_type_libelle.loc[
+            mapping_type_libelle.index.isin(ordinal_codes), "Type_Var"
+        ] = "ORDINAL"
+
+    # --- 7) Number of modalities (∞ for numerical)
+    def _n_modalities(var_code: str) -> float:
+        if var_code not in df_wide.columns:
+            return 0.0
+        return (
+            float("inf")
+            if mapping_type_libelle.loc[var_code, "Type_Var"] == "NUMERICAL"
+            else float(pd.Series(df_wide[var_code]).nunique(dropna=True))
+        )
+
+    mapping_type_libelle["NBR_MOD"] = mapping_type_libelle.index.map(_n_modalities)
+
+    # Sort by coverage (descending)
+    mapping_type_libelle = mapping_type_libelle.sort_values(
+        by="PERCENT_NON_NAN", ascending=False
+    )
+
+    # --- 8) Keep only requested columns: [ID, DATE] + covariables_list
+    keep_columns: List[str] = [var_id_final, var_temp, *covariables_list]
+    df_wide_filtered = df_wide[[c for c in keep_columns if c in df_wide.columns]].copy()
+
+    # --- 9) Filter mapping to variables actually present in the wide table (excluding ID/DATE)
+    present_vars = [c for c in df_wide_filtered.columns if c not in (var_id_final, var_temp)]
+    mapping_libelle_filtered = mapping_type_libelle[
+        mapping_type_libelle.index.isin(present_vars)
+    ].copy()
+
+    return df_wide_filtered, mapping_libelle_filtered
+
+
+def deduplicate_by_timestamp(
+    df_merge,
+    covariables_list,
+    var_id="ID",
+    var_crea="date_creation",
+    var_embd="embeddings"
+):
+    """
+    Deduplicate rows sharing the same (ID, date_creation), prioritizing rows with non-null embeddings.
+    If multiple rows have null embeddings but non-null structured data, keep the first.
+
+    If no duplicate timestamps are found, returns the original DataFrame and prints confirmation.
+    """
+    duplicated_mask = df_merge.duplicated(subset=[var_id, var_crea], keep=False)
+    nb_duplicates = duplicated_mask.sum()
+
+    if nb_duplicates == 0:
+        print("No duplicated timestamps found.")
+        return df_merge.copy()
+
+    print(f"Found {nb_duplicates} duplicated rows sharing the same (ID, date_creation). Proceeding to deduplicate...")
+
+    # Helper flags
+    df_merge['embeddings_is_notnull'] = df_merge[var_embd].notnull().astype(int)
+    df_merge['covariables_notnull'] = df_merge[covariables_list].notnull().any(axis=1).astype(int)
+
+    # Sort by priority
+    df_merge = df_merge.sort_values(
+        by=[var_id, var_crea, 'embeddings_is_notnull', 'covariables_notnull'],
+        ascending=[True, True, False, False]
+    )
+
+    # Drop duplicates (keep highest priority per group)
+    df_cleaned = df_merge.drop_duplicates(subset=[var_id, var_crea], keep='first')
+
+    # Drop helper columns
+    df_cleaned = df_cleaned.drop(columns=['embeddings_is_notnull', 'covariables_notnull'])
+    print(f"Deduplication done: {nb_duplicates} rows affected.")
+    return df_cleaned

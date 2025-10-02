@@ -520,24 +520,24 @@ def sk_cox(
     # Preprocess data for skglm format
     X, y = preprocess_skglm(Xt, y, print_infos=infos_preprocess)
 
+    print(f" --------> X.shape: {X.shape}\n")
+    print(f" --------> y.shape: {y.shape}\n")
+    
     # Compute sparse coefficients with skglm
     w_sk = skglm_risk(X, y, alpha)
+
+    print(f"w_sk.shape: {w_sk.shape}")
 
     # Compute linear risk scores
     risk_scores = np.dot(X, w_sk)
 
     # Build survival DataFrame
     df_survival = pd.DataFrame({
+        'ID':id_list,
         'event': y[:, 0],
         'time': y[:, 1],
         'risk_score': risk_scores
     })
-
-    # Fit Cox model on risk scores
-    cph = CoxPHFitter()
-    cph_fitted = cph.fit(df_survival, duration_col=var_time, event_col=var_event, formula="risk_score")
-
-    print(f"C-index on training data: {c_index_skglm(df_survival):.3f}")
 
     # Optionally attach patient IDs
     if id_list is not None and len(id_list) > 0:
@@ -545,6 +545,26 @@ def sk_cox(
             df_survival['ID'] = id_list
         else:
             raise ValueError("Size mismatch: 'df_survival' and 'id_list' must have the same length.")
+    
+    # print(f"""
+    # df_survival.shape: {df_survival.shape},
+    # event.shape: {df_survival['event'].shape}, 
+    # time.shape: {df_survival['time'].shape},
+    # risk_score.shape: {df_survival['risk_score'].shape}\n
+    # """)
+
+    print("---")
+    print("NaNs in risk_score:", df_survival['risk_score'].isna().sum())
+    print("Infs in risk_score:", np.isinf(df_survival['risk_score']).sum())
+
+    # Remove rows with NaN or inf in risk_score
+    df_survival = df_survival[np.isfinite(df_survival['risk_score'])].copy()
+
+    # Fit Cox model on risk scores
+    cph = CoxPHFitter()
+    cph_fitted = cph.fit(df_survival, duration_col=var_time, event_col=var_event, formula="risk_score")
+
+    print(f"C-index on training data: {c_index_skglm(df_survival):.3f}")
 
     return cph_fitted, df_survival, w_sk, X, y
 
@@ -610,6 +630,21 @@ def sk_cox_CV(
         'risk_score': risk_scores
     })
 
+    # Optionally attach patient IDs
+    if id_list is not None and len(id_list) > 0:
+        if len(df_survival) == len(id_list):
+            df_survival['ID'] = id_list
+        else:
+            raise ValueError("Size mismatch: 'df_survival' and 'id_list' must have the same length.")
+
+    print("---")
+    print("NaNs in risk_score:", df_survival['risk_score'].isna().sum())
+    print("Infs in risk_score:", np.isinf(df_survival['risk_score']).sum())
+
+    # Remove rows with NaN or inf in risk_score
+    df_survival = df_survival[np.isfinite(df_survival['risk_score'])].copy()
+
+
     # Initialize and cross-validate CoxPH model
     cph = CoxPHFitter()
     scores = k_fold_cross_validation(
@@ -625,13 +660,6 @@ def sk_cox_CV(
     cph_fitted = cph.fit(df_survival, duration_col=var_time, event_col=var_event, formula="risk_score")
 
     print(f"C-index on training data: {c_index_skglm(df_survival):.3f}")
-
-    # Optionally attach patient IDs
-    if id_list is not None and len(id_list) > 0:
-        if len(df_survival) == len(id_list):
-            df_survival['ID'] = id_list
-        else:
-            raise ValueError("Size mismatch: 'df_survival' and 'id_list' must have the same length.")
 
     # Sort by survival time
     df_survival = df_survival.sort_values(by='time', ascending=True).reset_index(drop=True)
@@ -733,18 +761,27 @@ def sk_cox_cvlambda(
         'risk_score': risk_scores
     })
 
-    cph = CoxPHFitter()
-    cph_fitted = cph.fit(df_survival, duration_col=var_time, event_col=var_event, formula="risk_score")
-
-    print(f"Best lambda_l1: {best_lambda}")
-    print(f"C-index on training data: {c_index_skglm(df_survival):.3f}")
-
     # Optionally attach patient IDs
     if id_list is not None and len(id_list) > 0:
         if len(df_survival) == len(id_list):
             df_survival['ID'] = id_list
         else:
             raise ValueError("Size mismatch: 'df_survival' and 'id_list' must have the same length.")
+
+
+    print("---")
+    print("NaNs in risk_score:", df_survival['risk_score'].isna().sum())
+    print("Infs in risk_score:", np.isinf(df_survival['risk_score']).sum())
+
+    # Remove rows with NaN or inf in risk_score
+    df_survival = df_survival[np.isfinite(df_survival['risk_score'])].copy()
+    
+
+    cph = CoxPHFitter()
+    cph_fitted = cph.fit(df_survival, duration_col=var_time, event_col=var_event, formula="risk_score")
+
+    print(f"Best lambda_l1: {best_lambda}")
+    print(f"C-index on training data: {c_index_skglm(df_survival):.3f}")
 
     return cph_fitted, df_survival, best_w_sk, cindex_scores_output, X, y, best_lambda
 
@@ -956,6 +993,13 @@ def skglm_datatest(
     if plot_curves:
         skglm_plt_surv_curves(cph, df_survival_test, print_all=print_all, indices_selected=indices_selected)
 
+    print("---")
+    print("NaNs in risk_score:", df_survival_test['risk_score'].isna().sum())
+    print("Infs in risk_score:", np.isinf(df_survival_test['risk_score']).sum())
+
+    # Remove rows with NaN or inf in risk_score
+    df_survival_test = df_survival_test[np.isfinite(df_survival_test['risk_score'])].copy()
+    
     # Compute C-index on the test set
     cindex_test = c_index_skglm(df_survival_test)
     print(f"Concordance index on test set: {cindex_test:.3f}")

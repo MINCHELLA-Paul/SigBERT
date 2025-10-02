@@ -275,7 +275,8 @@ def preprocess_sign(
     return (df, id_list) if return_id else df
 
 
-def signature_extract(
+
+def signature_extract0(
     df_OG,
     order=3,
     use_log=False,
@@ -387,6 +388,215 @@ def signature_extract(
     signature_results = []
 
     for id, group in df.groupby(var_patient):
+        path_cols = [var_temp]
+
+        if var_embd_used:
+            path_cols += [f'embedding_{i}' for i in range(embedding_dim)]
+
+        if var_structurees_list_OG:
+            path_cols += var_structurees_list
+
+        path = group[path_cols].values.astype(np.float64)
+
+        if path.shape[1] > 256:
+            raise ValueError(f"Path dimensionality exceeds allowed limit: {path.shape[1]} > 256")
+
+        start_point = np.zeros((1, path.shape[1]))
+        path = np.vstack([start_point, path])
+
+        signature = calculate_signature(
+            path,
+            order=order,
+            use_Levy=use_mat_Levy,
+            use_log=use_log,
+            apply_lead_lag=apply_lead_lag
+        )
+        signature_dict = {f'sig_{i+1}': sig for i, sig in enumerate(signature)}
+
+        signature_dict.update({
+            var_patient: id,
+            var_DEATH: group[var_DEATH].iloc[-1],
+            debut_etude: group[debut_etude].iloc[-1],
+            fin_etude: group[fin_etude].iloc[-1],
+            var_date_death: group[var_date_death].iloc[-1]
+        })
+
+        if var_known:
+            signature_dict['duration_known'] = group[var_known].iloc[-1]
+
+        signature_results.append(signature_dict)
+
+    signature_df = pd.DataFrame(signature_results)
+    cols = [var_patient] + [col for col in signature_df.columns if col != var_patient]
+    signature_df = signature_df[cols]
+
+    return signature_df, nbr_sig, nbr_levy
+
+
+def signature_extract(
+    df_OG,
+    order=3,
+    use_log=False,
+    var_temp='timestamp',
+    var_date_creation="date_creation",
+    var_embd='embeddings_reduced',
+    var_patient='ID',
+    var_DEATH='DEATH',
+    var_date_death="date_death",
+    debut_etude="date_start",
+    fin_etude="date_end",
+    interpolation_type = "linear",
+    var_known=None,
+    use_mat_Levy=False,
+    apply_lead_lag=False,
+    var_structurees_list_OG=None,
+    use_missing_encoding=False,
+    verbose=True
+):
+    """
+    Extract signature features from time series data, based on either embedding vectors,
+    structured variables, or both.
+
+    Parameters
+    ----------
+    df_OG : pd.DataFrame
+        Input DataFrame with sequential patient data.
+    order : int
+        Order of the (log-)signature to compute.
+    use_log : bool
+        If True, compute log-signatures instead of regular signatures.
+    var_temp : str
+        Name of the temporal variable (normalized between 0 and 1).
+    var_embd : str or None
+        Column name containing the input embeddings (if any).
+    var_patient : str
+        Column identifying the patient.
+    var_DEATH : str
+        Column indicating survival status.
+    var_date_death : str
+        Column indicating date of death.
+    debut_etude : str
+        Column name for start of follow-up.
+    fin_etude : str
+        Column name for end of follow-up.
+    interpolation : {"linear", "zeros"}, default="linear"
+        Strategy to handle missing values in structured variables:
+        - "linear": perform patient-wise linear interpolation, with backward/forward
+          filling as fallback.
+        - "zeros": replace all missing values by 0.
+    var_known : str or None
+        Column name for known duration (optional).
+    use_mat_Levy : bool
+        Whether to compute Levy areas (second-order signature terms).
+    apply_lead_lag : bool
+        Whether to apply the lead-lag transformation to the path.
+    var_structurees_list_OG : list of str or None
+        Structured variables to include in the signature path.
+    use_missing_encoding : bool
+        If True, binary indicators for missing structured variables are appended.
+    verbose : bool
+        If True, print summary information.
+
+    Returns
+    -------
+    signature_df : pd.DataFrame
+        DataFrame containing extracted signature features.
+    nbr_sig : int
+        Number of signature components (regular or log).
+    nbr_levy : int
+        Number of Levy area components (if applicable).
+    """
+
+    df = df_OG.copy()
+
+    var_embd_used = (var_embd is not None)
+    embedding_dim = 0
+
+    # If embeddings are used, split them into columns
+    if var_embd_used:
+        embedding_dim = len(df[var_embd].iloc[0])
+        for i in range(embedding_dim):
+            df[f'embedding_{i}'] = df[var_embd].apply(lambda x: x[i])
+
+    n_components = 1  # time component always included
+
+    # Structured variables
+    if var_structurees_list_OG:
+        var_structurees_list = var_structurees_list_OG.copy()
+
+        # Check existence of all structured variables
+        missing_cols = [c for c in var_structurees_list if c not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing structured variables in df: {missing_cols}")
+
+        # (1) Ensure numeric (non-numeric -> NaN)
+        df[var_structurees_list] = df[var_structurees_list].apply(pd.to_numeric, errors="coerce")
+
+        # Handle missing values according to interpolation mode
+        if interpolation_type == "linear":
+            # (2) Sort by time *within patient* before interpolation
+            sorted_idx = df.sort_values([var_patient, var_temp]).index
+            block = df.loc[sorted_idx, var_structurees_list]
+
+            # Linear interpolate internal gaps, then extend to edges (bfill/ffill)
+            block = (
+                block.groupby(df.loc[sorted_idx, var_patient], group_keys=False)
+                     .apply(lambda g: g.interpolate(method="linear").bfill().ffill())
+            )
+            # Assign back and restore original row order
+            df.loc[sorted_idx, var_structurees_list] = block.values
+
+            # (3) Fallback: if a variable is entirely NaN for a patient, fill with 0
+            df[var_structurees_list] = (
+                df.groupby(var_patient, group_keys=False)[var_structurees_list]
+                  .apply(lambda g: g.fillna(0.0))
+            )
+
+        elif interpolation_type == "zeros":
+            # Replace missing values by zeros
+            df[var_structurees_list] = df[var_structurees_list].fillna(0.0)
+        else:
+            raise ValueError(f"Unknown interpolation mode: {interpolation_type}")
+
+        # Standardize after imputation
+        scaler = StandardScaler()
+        df[var_structurees_list] = scaler.fit_transform(df[var_structurees_list])
+
+        # Optional: encode missing indicators if requested
+        if use_missing_encoding:
+            df, missing_indicators = encode_missing_paths(df, var_structurees_list)
+            var_structurees_list += missing_indicators
+
+        n_components += len(var_structurees_list)
+
+    print(f"Number of patients after interpolation:{df[var_patient].nunique()}")
+    
+    if var_embd_used:
+        n_components += embedding_dim
+
+
+    if use_log:
+        nbr_sig = iisignature.logsiglength(n_components, order)
+    else:
+        nbr_sig = iisignature.siglength(n_components, order)
+
+    nbr_sig_order2 = iisignature.siglength(n_components, 2)
+    nbr_levy = nbr_sig_order2 - (2 * n_components)
+
+    if verbose:
+        if use_log:
+            print(f"Number of log-signature components (order {order}): {nbr_sig}")
+        else:
+            print(f"Number of signature components (order {order}): {nbr_sig}")
+        if use_mat_Levy:
+            print(f"Number of Levy area components: {nbr_levy}")
+
+    signature_results = []
+
+    for id, group in df.groupby(var_patient):
+        # Ensure chronological sorting
+        group = group.sort_values(var_temp)
+
         path_cols = [var_temp]
 
         if var_embd_used:

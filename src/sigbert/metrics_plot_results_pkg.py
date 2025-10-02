@@ -15,7 +15,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from scipy.stats import f_oneway, kruskal, pearsonr, spearmanr, ttest_ind
+from scipy.stats import f_oneway, kruskal, pearsonr, spearmanr, ttest_ind, skew, normaltest, kstest, gamma, weibull_min, lognorm
 
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test, multivariate_logrank_test
@@ -494,6 +494,65 @@ def plot_risk_score_distribution_by_event(
         ttest_results = ttest_risk_scores(df_plot)
     
     return df_plot, ttest_results
+
+
+
+
+def plot_risk_score_histogram(
+    df_survival,
+    risk_column='risk_score',
+    color='green',
+    export_plot=None,
+    signif=6,
+    do_ttest=True,
+    alpha_ttest=0.05
+):
+    values = df_survival[risk_column].dropna().values
+
+    # Descriptive statistics
+    desc_stats = {
+        'n_obs': int(len(values)),
+        'mean': np.round(np.mean(values), signif),
+        'std': np.round(np.std(values, ddof=1), signif),
+        'skewness': np.round(skew(values), signif),
+        'min': np.round(np.min(values), signif),
+        'Q1': np.round(np.percentile(values, 25), signif),
+        'median': np.round(np.median(values), signif),
+        'Q3': np.round(np.percentile(values, 75), signif),
+        'max': np.round(np.max(values), signif)
+    }
+
+    # Plot histogram
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.histplot(values, kde=True, color=color, ax=ax)
+    ax.set_xlabel('Predicted Risk Score')
+    ax.set_ylabel('Count')
+    ax.set_title('Risk Score Distribution')
+    plt.show()
+
+    # Normality test
+    if do_ttest:
+        stat, pval_norm = normaltest(values)
+        if pval_norm < alpha_ttest:
+            print(f"Normality test p-value = {pval_norm:.3g} < {alpha_ttest}. Reject normality assumption.")
+        else:
+            print(f"Normality test p-value = {pval_norm:.3g} >= {alpha_ttest}. Fail to reject normality assumption.")
+
+        # Fit and KS-test for alternative distributions
+        for dist_name, dist in [('Gamma', gamma), ('Weibull', weibull_min), ('LogNormal', lognorm)]:
+            params = dist.fit(values)
+            # Build cdf function with fitted params
+            cdf_func = lambda x: dist.cdf(x, *params)
+            stat, pval = kstest(values, cdf_func)
+            print(f"{dist_name} KS test p-value = {pval:.3g} (params={params})")
+
+    return desc_stats
+
+
+
+
+
+
 
 def plot_km_by_risk_quartiles(
     df_survival,
@@ -1432,6 +1491,101 @@ def plot_smoothed_cindex_by_report_count(
     plt.ylim([0.62, 0.77])
 
     # Save if export path is given
+    if export_path:
+        plt.savefig(export_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to {export_path}")
+
+    plt.show()
+
+
+def plot_smoothed_cindex_by_variable(
+    df,
+    var_abs="max_reports",
+    var_ord="Mean C-index",
+    std_ord="Std C-index",
+    window_size=5,
+    reference_cindex=0.75,
+    vertical_line_x=28,
+    vertical_line_y=0.7,
+    ci_level=0.95,
+    n_folds=10,
+    export_path=None
+):
+    """
+    Plot a smoothed curve of a performance metric (e.g., C-index) as a function of a given variable.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing at least the following columns:
+        - var_abs (x-axis)
+        - var_ord (mean metric)
+        - std_ord (std deviation of the metric)
+    var_abs : str, optional
+        Column name to use as the x-axis variable (default: "max_reports").
+    var_ord : str, optional
+        Column name to use as the y-axis variable (default: "Mean C-index").
+    std_ord : str, optional
+        Column name for the standard deviation of the y-variable (default: "Std C-index").
+    window_size : int, optional
+        Window size for the moving average smoothing (default: 5).
+    reference_cindex : float, optional
+        Horizontal reference line (default: 0.75).
+    vertical_line_x : int or float, optional
+        X-position for a vertical reference line (default: 28).
+    vertical_line_y : float, optional
+        Y-position for the vertical reference annotation (default: 0.7).
+    ci_level : float, optional
+        Confidence interval level (default: 0.95).
+    n_folds : int, optional
+        Number of test sets used for estimating standard deviation (default: 10).
+    export_path : str or None
+        If provided, path to save the figure (e.g., './fig.png').
+
+    Returns
+    -------
+    None
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # Extract columns
+    x = df[var_abs]
+    y = df[var_ord]
+    y_std = df[std_ord]
+
+    # Compute confidence intervals
+    z = 1.96 if ci_level == 0.95 else 1.0
+    ci_upper = y + z / np.sqrt(n_folds) * y_std
+    ci_lower = y - z / np.sqrt(n_folds) * y_std
+
+    # Define moving average
+    def moving_average(data, window_size):
+        return np.convolve(data, np.ones(window_size) / window_size, mode='valid')
+
+    # Smoothed values
+    x_smooth = x[window_size - 1:]
+    y_smooth = moving_average(y, window_size)
+    ci_upper_smooth = moving_average(ci_upper, window_size)
+    ci_lower_smooth = moving_average(ci_lower, window_size)
+
+    # Plot
+    plt.figure(figsize=(10, 7))
+    plt.plot(x_smooth, y_smooth, linestyle="-", color="#07AAE4", linewidth=2, label=var_ord)
+    plt.fill_between(x_smooth, ci_lower_smooth, ci_upper_smooth, color="#07AAE4", alpha=0.2, label=f"{int(ci_level * 100)}% CI")
+
+    # Reference lines
+    plt.axhline(y=reference_cindex, color="#B21D61", linestyle="--", linewidth=2, label=f"Reference ({reference_cindex})")
+    plt.plot([vertical_line_x, vertical_line_x], [plt.ylim()[0], vertical_line_y], color="#B21D61", linestyle="--", linewidth=1.2, label=f"{vertical_line_x} for value {vertical_line_y}")
+
+    # Plot formatting
+    plt.xlabel(var_abs.replace("_", " ").title(), fontsize=15)
+    plt.ylabel(var_ord.replace("_", " ").title(), fontsize=15)
+    plt.grid(True, linestyle="--", alpha=0.7)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+
+    # Export if path provided
     if export_path:
         plt.savefig(export_path, dpi=300, bbox_inches='tight')
         print(f"Figure saved to {export_path}")
