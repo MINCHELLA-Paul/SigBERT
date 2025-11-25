@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import time
 from tqdm import tqdm
+from datetime import timedelta
 
 import torch
 
@@ -608,6 +609,8 @@ def prep_import(
     var_known="duration_known",
     var_death="DEATH",
     var_duration="duree",
+    var_time = 'time', 
+    var_event = 'event',
     interpolation_type = "linear",
     var_struct_seq_list_OG=None,
     use_missing_encoding=False,
@@ -737,7 +740,21 @@ def prep_import(
         print(f"Total time: {time.time() - start:.2f} seconds")
         print("-" * 70)
 
-    return Xt, y, features_name, nbr_sig, nbr_levy, id_list
+    # ------------------------------------------------------------------
+    # Create df_study: combine IDs, features, and survival outcomes
+    # ------------------------------------------------------------------
+    df_study = pd.DataFrame(Xt, columns=features_name)
+    df_study.insert(0, var_id, id_list)  # Add ID as first column
+    df_study[var_event] = y[var_event].astype(bool)
+    df_study[var_time] = y[var_time].astype(float)
+
+    if print_progress:
+        print("Survival analysis preprocessing completed.")
+        print(f"Total time: {time.time() - start:.2f} seconds")
+        print("-" * 70)
+        print(f"df_study created with shape: {df_study.shape}")
+
+    return Xt, y, features_name, nbr_sig, nbr_levy, id_list, df_study
 
 
 
@@ -1289,9 +1306,103 @@ def make_train_test(
 
 
 
-
-
 def make_df_conform(
+    df: pd.DataFrame,
+    var_id: str = 'ID',
+    var_start: str = 'date_start',
+    var_end: str = 'date_end',
+    var_death: str = 'DEATH',
+    var_death_date: str = 'date_death',
+    var_T: str = 'T_days',
+    var_known: Optional[str] = None,     # e.g. 'duration_known'
+    var_gap: str = 'death_know_gap',
+    limite_gap: Optional[int] = None,    # ← FIXED here
+    verbose: bool = True
+):
+    """
+    Conform dataset for survival analysis using patient-level T_days.
+    Returns (df_filtered, df_last_obs_one_row_per_patient, id_list).
+    """
+    # Ensure datetime
+    for col in [var_start, var_end, var_death_date]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+
+    # If T_days missing, compute once from last row per patient
+    if var_T not in df.columns:
+        if verbose:
+            print(f"[make_df_conform] '{var_T}' not found — computing from dates.")
+        df_last_obs_tmp = (
+            df.sort_values(by=var_end)
+              .groupby(var_id, as_index=False)
+              .last()
+              .loc[:, [var_id, var_death, var_start, var_end, var_death_date]]
+              .assign(**{
+                  var_T: lambda x: np.where(
+                      x[var_death] == 1,
+                      (x[var_death_date] - x[var_start]).dt.days,
+                      (x[var_end] - x[var_start]).dt.days
+                  )
+              })
+        )
+        df = df.merge(df_last_obs_tmp[[var_id, var_T]], on=var_id, how='left')
+
+    # Build one-line-per-patient view
+    keep_cols = [c for c in [var_id, var_death, var_start, var_end, var_death_date, var_T, var_known] if c]
+    df_last_obs = (
+        df.sort_values(by=var_end)
+          .groupby(var_id, as_index=False)
+          .last()[keep_cols]
+          .copy()
+    )
+
+    # Compute death gap only for deceased
+    if var_known:
+        if var_known not in df_last_obs.columns:
+            raise ValueError(f"'{var_known}' not found in DataFrame.")
+        df_last_obs[var_gap] = np.where(
+            df_last_obs[var_death] == 1,
+            (df_last_obs[var_death_date] - (df_last_obs[var_start] + pd.to_timedelta(df_last_obs[var_known], unit='d'))).dt.days,
+            np.nan
+        )
+
+    # Filter invalid cases
+    df_last_obs = (
+        df_last_obs
+        .dropna(subset=[var_start, var_end, var_T])
+        .loc[df_last_obs[var_T] > 0]
+        .reset_index(drop=True)
+    )
+    id_list = df_last_obs[var_id].values
+
+    # Filter df accordingly
+    initial_lines = len(df)
+    initial_ids = df[var_id].nunique()
+    df = df[df[var_id].isin(id_list)].copy()
+    final_lines = len(df)
+    final_ids = df[var_id].nunique()
+
+    if verbose:
+        print(f"Removed rows: {initial_lines - final_lines}")
+        print(f"Removed patient IDs: {initial_ids - final_ids}")
+        kept_prop = (final_ids / initial_ids) if initial_ids else 0.0
+        print(f"Kept patient IDs: {final_ids}/{initial_ids} ({kept_prop:.1%})")
+
+    # Optional: filter by death gap threshold
+    if limite_gap is not None and var_known:
+        pre_gap_n = df_last_obs.shape[0]
+        df_last_obs = df_last_obs[df_last_obs[var_gap] <= limite_gap].copy()
+        removed_gap = pre_gap_n - df_last_obs.shape[0]
+        id_list = df_last_obs[var_id].values
+        df = df[df[var_id].isin(id_list)].copy()
+        if verbose:
+            print(f"Removed by {var_gap} ≤ {limite_gap}: {removed_gap} patients")
+
+    return df, df_last_obs, id_list
+
+
+
+def make_df_conform0(
     df,
     var_id='ID',
     var_start='date_start',
@@ -1615,7 +1726,7 @@ def global_sigbert_process(
     df_all_quartile = df_all.sort_values(by=[var_id, var_crea]).groupby(var_id).head(max_reports)
     std_reports = df_all_quartile.groupby(var_id)[var_crea].count().std()
 
-    df_train_new, df_last_obs, id_list_train = make_df_conform(df_train_new_OG, verbose=False)
+    df_train_new, df_last_obs, id_list_train = make_df_conform(df_train_new_OG, var_T=var_duration,verbose=False)
     total_train = df_last_obs[var_id].nunique()
     print(f"\nTotal number of individuals in the train set: {total_train}")
 
@@ -1649,7 +1760,11 @@ def global_sigbert_process(
     df_train = apply_linear_projection(df_train_new, R_comp, var_embd=var_embd)
 
     start_training = time.time()
-    Xt, y, features_name, nbr_sig, nbr_levy, id_list_train_V2 = prep_import(
+
+    # Initialisation of df_study_all
+    df_study_all = pd.DataFrame()
+    
+    Xt, y, features_name, nbr_sig, nbr_levy, id_list_train_V2, df_study_train = prep_import(
         df_train,
         t_pred=None,
         order_sign=order_sign,
@@ -1659,6 +1774,9 @@ def global_sigbert_process(
         print_progress=print_progress
     )
 
+    # Add `df_study_train` in `df_study_all`
+    df_study_all = pd.concat([df_study_all, df_study_train], ignore_index=True)
+    
     if use_other_covar:
         if df_matrix_covar is not None:
             df_sig = pd.DataFrame({var_id: id_list_train_V2})
@@ -1694,7 +1812,7 @@ def global_sigbert_process(
 
     for i, df_test_new in enumerate(test_groups, start=1):
         df_test = apply_linear_projection(df_test_new, R_comp, var_embd=var_embd)
-        Xt_test, y_test, _, _, _, id_list_test_i = prep_import(
+        Xt_test, y_test, _, _, _, id_list_test_i, df_study_test_i = prep_import(
             df_test,
             t_pred=None,
             order_sign=order_sign,
@@ -1703,6 +1821,10 @@ def global_sigbert_process(
             use_mat_Levy=use_mat_Levy,
             print_progress=print_progress
         )
+
+        # Add `df_study_test_i` in `df_study_all`
+        df_study_all = pd.concat([df_study_all, df_study_test_i], ignore_index=True)
+
 
         if use_other_covar:
             if df_matrix_covar is not None:
@@ -1763,7 +1885,7 @@ def global_sigbert_process(
     return (
         df_results, cph, df_survival, w_sk, scores, X, y, y_cox,
         c_index_train, c_index_test_list, c_index_test_mean,
-        c_index_test_std, df_survival_test_list
+        c_index_test_std, df_survival_test_list, df_study_all
     )
 
 
@@ -2566,3 +2688,156 @@ def deduplicate_by_timestamp(
     df_cleaned = df_cleaned.drop(columns=['embeddings_is_notnull', 'covariables_notnull'])
     print(f"Deduplication done: {nb_duplicates} rows affected.")
     return df_cleaned
+
+
+
+
+########################################################################################
+#                                                                                      #
+#                                                                                      #
+#                                                                                      #
+#                                   LANDMARK APPROACH                                  #
+#                                                                                      #
+#                                                                                      #
+#                                                                                      #
+########################################################################################
+
+
+
+def compute_survival_time(df: pd.DataFrame,
+                          var_id: str = 'ID',
+                          var_death: str = 'DEATH',
+                          var_start: str = 'date_start',
+                          var_end: str = 'date_end',
+                          var_death_date: str = 'date_death',
+                          new_var_time: str = 'T_days',
+                          verbose: bool = True):
+    """
+    Compute survival time T_i = (date_death - date_start) if death occurred,
+    else (date_end - date_start). The result is added to df for each patient's
+    observations and also returned as a patient-level summary.
+    """
+    # Ensure datetime format
+    for col in [var_start, var_end, var_death_date]:
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+
+    # Compute T_i for each patient (one row per ID)
+    df_surv = (
+        df.sort_values(by=var_end)
+          .groupby(var_id, as_index=False)
+          .last()
+          .loc[:, [var_id, var_death, var_start, var_end, var_death_date]]
+          .assign(
+              **{
+                  new_var_time: lambda x: np.where(
+                      x[var_death] == 1,
+                      (x[var_death_date] - x[var_start]).dt.days,
+                      (x[var_end] - x[var_start]).dt.days
+                  )
+              }
+          )
+    )
+
+    # Merge survival times back to full df
+    df = df.merge(df_surv[[var_id, new_var_time]], on=var_id, how='left')
+
+    if verbose:
+        print(f"[compute_survival_time] {df_surv.shape[0]} patients processed.")
+        print(f"  Mean T: {df_surv[new_var_time].mean():.1f} days "
+              f"({df_surv[new_var_time].std():.1f} SD)")
+        print(f"  Deaths: {df_surv[var_death].sum()} / {df_surv.shape[0]}")
+
+    return df, df_surv
+
+
+
+def define_landmark_cohort(df: pd.DataFrame,
+                           landmark_months: int,
+                           var_time: str = 'date_creation',
+                           var_id: str = 'ID',
+                           var_start: str = 'date_start',
+                           var_end: str = 'date_end',
+                           var_T: str = 'T_days',
+                           window_months: int = 6,
+                           verbose: bool = True):
+    """
+    Build the landmark cohort for a given relative time (in months) since baseline.
+    Patients with T_days >= L_days are kept, reports restricted to [L-w, L].
+    Returns:
+        - df_L : sequential data restricted to [L-w, L]
+        - patients_in_study : list of eligible IDs
+        - df_gamma : one row per patient with gamma_i(L)
+    """
+
+    # Ensure datetime types
+    for col in [var_time, var_start, var_end]:
+        df[col] = pd.to_datetime(df[col], errors='coerce')
+
+    # Convert months to days
+    L_days = int(landmark_months * 30)
+    w_days = int(window_months * 30)
+
+    # Patients still in study at the landmark: T_days >= L_days
+    patients_in_study = df.loc[df[var_T] >= L_days, var_id].unique().tolist()
+
+    # Subset: keep only patients at risk
+    df_sub = df[df[var_id].isin(patients_in_study)].copy()
+
+    # Compute days since start
+    df_sub['days_since_start'] = (df_sub[var_time] - df_sub[var_start]).dt.days
+
+    # Apply time window [L-w, L]
+    total_obs_before = len(df_sub)
+    df_L = df_sub[(df_sub['days_since_start'] >= (L_days - w_days)) &
+                  (df_sub['days_since_start'] <= L_days)].copy()
+    total_obs_after = len(df_L)
+    obs_removed = total_obs_before - total_obs_after
+    prop_removed = obs_removed / total_obs_before if total_obs_before > 0 else 0
+
+    # ---------------------------------------------------------------
+    # Compute gamma_i(L), but DO NOT MERGE into sequential dataframe
+    # ---------------------------------------------------------------
+    first_obs = (
+        df_L.groupby(var_id)['days_since_start']
+        .min()
+        .reset_index()
+        .rename(columns={'days_since_start': 'first_obs_days'})
+    )
+    first_obs['gamma'] = ((L_days - first_obs['first_obs_days']) < w_days).astype(int)
+
+    # Prepare gamma output: only ID and gamma
+    df_gamma = first_obs[[var_id, 'gamma']].copy()
+    # ---------------------------------------------------------------
+
+    # ===============================================================
+    # === IMPORTANT LANDMARK FIX: UPDATE RESIDUAL SURVIVAL TIME R ===
+    # ===============================================================
+    df_L["R"] = df_L[var_T] - L_days
+    # ===============================================================
+
+    # ====================================================================
+    # === SECOND IMPORTANT FIX: UPDATE EVENT INDICATOR FOR LANDMARKING ===
+    # === δ_i(L) = 1 if patient dies after L; 0 otherwise                ===
+    # ====================================================================
+    df_L["DEATH_L"] = (
+        (df_L[var_T] > L_days) &
+        (df_L["DEATH"] == 1)
+    ).astype(int)
+    # ====================================================================
+
+    # --- Verbose summary ---
+    if verbose:
+        n_total = df[var_id].nunique()
+        n_kept = len(patients_in_study)
+        n_gamma = df_gamma['gamma'].sum()
+        prop_gamma = n_gamma / n_kept if n_kept > 0 else 0
+
+        print(f"[Landmark {landmark_months} mo] Patients kept: {n_kept}/{n_total} "
+              f"({n_total - n_kept} excluded)")
+        print(f"  → Short-history γ=1: {n_gamma}/{n_kept} = {prop_gamma:.1%}")
+        print(f"  → Observations kept: {total_obs_after}/{total_obs_before} "
+              f"({100 * (1 - prop_removed):.1f}% retained, {100 * prop_removed:.1f}% removed)")
+        print(f"  → Residual survival R_i computed (min={df_L['R'].min()} days).")
+        print(f"  → Landmark events computed: DEATH_L sum = {df_L['DEATH_L'].sum()}.")
+
+    return df_L, patients_in_study, df_gamma

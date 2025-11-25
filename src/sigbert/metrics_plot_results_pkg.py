@@ -857,7 +857,9 @@ def plot_dynamic_auc(
     df_survival_test_list,
     test_groups,
     Nstart=0,
-    y_time_max=3800,
+    xlim=None,
+    ylim=None,
+    y_time_max = 3800,
     export_fig=None,
     verbose=True
 ):
@@ -975,8 +977,12 @@ def plot_dynamic_auc(
     plt.title("Time-dependent AUC with 95% Confidence Interval", fontsize=17)
     plt.legend(fontsize=12)
     plt.grid()
-    plt.xlim(114, 3400)
-    plt.ylim(0.7, 0.9)
+    # Optional axis limits
+    if xlim is not None:
+        plt.xlim(xlim)
+    if ylim is not None:
+        plt.ylim(ylim)
+
 
     if export_fig:
         plt.savefig(export_fig, dpi=300, bbox_inches='tight')
@@ -1591,3 +1597,53 @@ def plot_smoothed_cindex_by_variable(
         print(f"Figure saved to {export_path}")
 
     plt.show()
+
+
+
+def compute_integrated_auc(times, auc_values, t_min=None, t_max=None, verbose=True):
+    """
+    Compute the integrated time-dependent AUC (iAUC).
+
+    Parameters
+    ----------
+    times : array-like
+        Time points at which AUC(t) was evaluated.
+    auc_values : array-like
+        Corresponding AUC(t) values.
+    t_min : float, optional
+        Lower integration bound (default: min(times)).
+    t_max : float, optional
+        Upper integration bound (default: max(times)).
+    verbose : bool, default=True
+        Print the iAUC result.
+
+    Returns
+    -------
+    iauc : float
+        Integrated AUC over [t_min, t_max].
+    """
+    times = np.asarray(times)
+    auc_values = np.asarray(auc_values)
+
+    # Clean NaN values
+    mask = ~np.isnan(times) & ~np.isnan(auc_values)
+    times, auc_values = times[mask], auc_values[mask]
+    if len(times) < 2:
+        raise ValueError("Not enough valid AUC values for integration.")
+
+    # Define integration limits
+    t_min = t_min if t_min is not None else times.min()
+    t_max = t_max if t_max is not None else times.max()
+
+    # Restrict domain
+    mask = (times >= t_min) & (times <= t_max)
+    times, auc_values = times[mask], auc_values[mask]
+
+    # Numerical integration (trapezoidal rule)
+    area = np.trapz(auc_values, times)
+    iauc = area / (t_max - t_min)
+
+    if verbose:
+        print(f"Integrated AUC (iAUC) over [{t_min:.1f}, {t_max:.1f}] = {iauc:.4f}")
+
+    return iauc
